@@ -50,7 +50,7 @@ const STAKING_ABI = [
   {"inputs":[{"name":"user","type":"address"},{"name":"index","type":"uint256"}],"name":"stakes","outputs":[{"name":"amount","type":"uint256"},{"name":"depositedTimestamp","type":"uint256"},{"name":"lockedUntilTimestamp","type":"uint256"},{"name":"rewardPerTokenPaid","type":"uint256"},{"name":"reward","type":"uint256"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"user","type":"address"}],"name":"getUserTotalStakeAmount","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"amount","type":"uint256"}],"name":"unstake","outputs":[],"stateMutability":"nonpayable","type":"function"},
-  {"inputs":[],"name":"withdrawAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
+  {"inputs":[{"name":"amount","type":"uint256"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"}, // Changed to withdraw
   {"inputs":[],"name":"token","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"user","type":"address"}],"name":"getUserWithdrawalRequestCount","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
   {"inputs":[{"name":"user","type":"address"},{"name":"index","type":"uint256"}],"name":"withdrawalRequests","outputs":[{"name":"amount","type":"uint256"},{"name":"requestedTimestamp","type":"uint256"},{"name":"cooldownPeriodEndTimestamp","type":"uint256"}],"stateMutability":"view","type":"function"},
@@ -339,14 +339,18 @@ async function executeUnstake(publicClient, compromisedWalletAddr, secureWallet,
 }
 
 async function executeWithdrawAndRescue(publicClient, compromisedWalletAddr, secureWallet, privateKeys, amount) {
-  console.log(`--- ACTION 2: Sending WITHDRAW & RESCUE intent for ${compromisedWalletAddr} with amount ${bigintToDecimalString(amount)} ---`);
+  console.log(`--- ACTION 2: Sending WITHDRAW intent for ${compromisedWalletAddr} with amount ${bigintToDecimalString(amount)} ---`);
   const compromisedPk = privateKeys[compromisedWalletAddr.toLowerCase()];
   const decimals = await getTokenDecimals(publicClient, ERA_TOKEN_ADDRESS);
   const amountString = bigintToDecimalString(amount, decimals);
   const intent = { 
     type: 'staking', 
     targetContract: STAKING_CONTRACT_ADDRESS, 
-    claimHex: encodeFunctionData({ abi: STAKING_ABI, functionName: 'withdrawAll' }), 
+    claimHex: encodeFunctionData({ 
+      abi: STAKING_ABI, 
+      functionName: 'withdraw', 
+      args: [amount] // Changed to withdraw with amount
+    }), 
     tokens: [{ type: 'erc20', address: ERA_TOKEN_ADDRESS, amount: amountString }], 
     sweepEth: false, 
     recoveryAddress: secureWallet.address, 
