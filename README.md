@@ -14,97 +14,130 @@ This tool handles raw private keys. While it sends them encrypted to a trusted r
 
 ***
 
-## How It Works
+This script is a specialized tool designed to rescue assets from compromised wallets by leveraging the power of [EIP-7702](https://eips.ethereum.org/EIPS/eip-7702) and a custom relayer. It is particularly focused on time-sensitive operations like withdrawing assets after a cooldown period has elapsed.
 
-The system is a single Node.js script that operates in two modes (`check` and `rescue`).
+## Core Concepts: How It Works
 
-1.  **`check` mode:** This command reads your wallet addresses from `pk.txt`, checks a specific staking contract on-chain for locked assets, and generates a `*-staking-info.txt` file. This file acts as the input for the rescue bot.
+The primary challenge in rescuing assets from a compromised wallet is that the attacker (the "sweeper bot") instantly drains any ETH sent to it to pay for gas fees. This makes it impossible to execute transactions conventionally.
 
-2.  **`rescue` mode:** This command starts a continuous bot that monitors your wallets. It operates in two automated stages:
-    *   **Stage 1 (Unstake):** When a wallet's staking lock expires, the bot sends an encrypted request to a relayer to execute an `unstakeAll()` transaction. This starts the contract's 7-day cooldown period. The bot records this action in `pending_withdrawal.json`.
-    *   **Stage 2 (Withdraw & Rescue):** After the 7-day cooldown is over, the bot sends a second request to the relayer. This executes a batch transaction that first calls `withdrawAll()` (moving the tokens to the compromised wallet) and then immediately calls `transfer()` to sweep the rescued tokens to your secure wallet.
+This tool solves that problem by using two key mechanisms:
 
-## Requirements
+1.  **EIP-7702 Authorization**: This Ethereum standard allows a wallet (the compromised one) to sign a message that authorizes another wallet (the secure one) to execute transactions on its behalf. The compromised wallet essentially says, "I authorize this secure address to act as me for this specific transaction."
 
-*   [Node.js](https://nodejs.org/) (v18 or higher recommended)
-*   `npm` package manager
+2.  **Relayer Service**: The signed authorization and the transaction details (the "intent") are sent to a trusted relayer. The relayer then pays the gas fees from its own funds and submits the transaction to the blockchain. The secure wallet never needs to send ETH to the compromised one.
 
-## Setup
+This combination allows the secure wallet to control the compromised wallet's assets and execute rescue operations without alerting the sweeper bot.
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/edwinosky/Caldera-ERA-EIP7702.git
-    cd Caldera-ERA-EIP7702
-    ```
+## Key Features
 
-2.  **Install dependencies:**
-    ```bash
-    npm install
-    ```
+-   **Automated Cooldown Detection**: The bot continuously monitors the blockchain to precisely determine when a withdrawal's cooldown period has ended.
+-   **EIP-7702 Native Integration**: Uses a modern, gas-efficient authorization standard for secure, delegated transactions.
+-   **Dynamic Transaction Building**: Automatically constructs the correct transaction calldata (`claimHex`) from the contract's ABI, preventing errors from manual encoding.
+-   **Centralized Configuration**: A clean and simple setup using a `.env` file for secrets and a `campaign.json` for target-specific parameters.
+-   **Atomic Operations**: Leverages the relayer's `revertOnError` feature to ensure that if any part of the rescue fails, the entire transaction is reverted.
+-   **Detailed Logging**: Provides comprehensive logs for monitoring and debugging every step of the process.
+
+## System Requirements
+
+-   Node.js (v18 or higher recommended)
+-   `npm` or a similar package manager
+-   A `.env` file for environment variables.
+-   A `campaign.json` file to define the rescue target.
+-   A `pk.txt` file containing the private keys of the compromised wallets.
 
 ## Configuration
 
-You need to create two files in the root of the project. **Add them to your `.gitignore` file immediately.**
+### 1. Environment Variables (`.env`)
 
-1.  **`pk.txt`:** This file stores the private keys of your compromised wallets. The bot uses this to derive addresses and sign rescue authorizations.
+Create a `.env` file in the root directory with the following variables:
 
-    *Format: `0xPrivateKey` (one per line)*
+```env
+# A secure RPC URL, preferably a private one (e.g., from Tenderly, Alchemy, Infura)
+RPC_URL=https://your-rpc-provider.com/your-api-key
 
-    **Example `pk.txt`:**
-    ```
-    0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-    ```
+# The private key of your secure wallet, which will control the rescue operations
+SECURE_WALLET_PK=0x...
+```
 
-2.  **`.env`:** This file stores your secure wallet's private key and your RPC endpoint.
+### 2. Campaign File (`campaign.json`)
 
-    **Example `.env`:**
-    ```
-    # Your secure wallet that has ETH and will receive the rescued tokens.
-    SECURE_WALLET_PK="0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+This file defines the specifics of the rescue operation.
 
-    # An MEV-protected RPC URL is highly recommended (e.g., from Flashbots, bloXroute, etc.).
-    RPC_URL="https://rpc.mevblocker.io/fast"
+```json
+{
+  "name": "My Staking Rescue Campaign",
+  "chainId": 1,
+  "targetContractAddress": "0x...",
+  "tokenAddress": "0x...",
+  "abiFile": "staking-abi.json"
+}
+```
 
-    # The address of the token being rescued (e.g., Caldera's ERA token).
-    ERA_TOKEN_ADDRESS="0xE2AD0B35A943A43896472A2a0109bA78546C7924"
-    ```
+-   `name`: A descriptive name for the campaign.
+-   `chainId`: The ID of the target blockchain (e.g., `1` for Ethereum Mainnet).
+-   `targetContractAddress`: The address of the contract to interact with (e.g., the staking contract).
+-   `tokenAddress`: The address of the token being rescued.
+-   `abiFile`: The path to the JSON ABI file for the `targetContractAddress`.
+
+### 3. Compromised Keys (`pk.txt`)
+
+Create a `pk.txt` file and list the private keys of the compromised wallets, one per line.
+
+```
+0x...
+0x...
+0x...
+```
 
 ## Usage
 
-### Step 1: Find Staked Wallets (`check`)
+First, install the required dependencies:
+```bash
+npm install
+```
 
-First, run the `check` command to find which of your wallets have assets at stake.
+### 1. Check Asset Status
 
-1.  Make sure your `pk.txt` file is populated.
-2.  Run the command:
-    ```bash
-    node index.js check
-    ```
-3.  The script will prompt you for your RPC URL and the staking contract address.
-4.  It will create a file like `ERA-0xa148491D...-staking-info.txt`, which the `rescue` command needs to operate.
+To get a report of all wallets with pending withdrawals and their current status, run the `check` command. This is a read-only operation and will not execute any transactions.
 
-### Step 2: Run the Rescue Bot (`rescue`)
+```bash
+node airdrop-rescuer.js check -c campaign.json
+```
 
-Once the `*-staking-info.txt` file exists, you can start the rescue bot. It will run continuously, monitoring and executing the two stages of the rescue.
+This will generate a file named `TOKEN_SYMBOL-CONTRACT_ADDRESS-withdraw-info.txt` with the results.
 
-1.  Make sure your `.env` file is configured correctly.
-2.  Start the bot:
-    ```bash
-    node index.js rescue
-    ```
-3.  The bot will now run, checking for wallets ready for `unstake` or `withdraw`. It will automatically send intents to the relayer when the time is right. You can leave it running (e.g., on a server or using a process manager like `pm2`).
+### 2. Start the Rescue Bot
 
-## Testing with Tenderly
+To start the automated bot that will monitor and execute withdrawals as soon as they become available, run the `rescue` command:
 
-It is **highly recommended** to test the entire flow on a Tenderly fork before running on mainnet.
+```bash
+node airdrop-rescuer.js rescue -c campaign.json
+```
 
-1.  Create a fork on [Tenderly](https://tenderly.co/).
-2.  Set the `RPC_URL` in your `.env` file to the Tenderly fork's RPC URL.
-3.  Run `node index.js check` against the fork.
-4.  Run `node index.js rescue`. The bot will start monitoring.
-5.  Use `curl` to advance the fork's time to trigger the `unstake` action.
-    ```
-    curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"evm_setNextBlockTimestamp","params":["0x...TimestampHEX"],"id":1}' "YourTenderlyForkURLRPC"
-    ```
-7.  After the `unstake` transaction succeeds, advance the time again by 7+ days to trigger the final `withdraw` action.
+The bot will run continuously, checking for ready withdrawals and executing them via the relayer.
+
+## Extensibility and Other Implementations
+
+While this tool is configured for staking withdrawals, its architecture is highly flexible and can be adapted for a wide range of rescue operations. The core logic is centered around the `intent` object sent to the relayer.
+
+By modifying the `triage` logic and how the `claimHex` is built, you can adapt this bot for other scenarios, such as:
+
+-   **Claiming Airdrops**: The `triage` function could check a Merkle tree or a contract's state to see if a wallet is eligible. The `buildClaimHex` function would then encode the `claim()` function call.
+-   **Vesting Contracts**: Monitor a vesting contract and execute `release()` or `claim()` functions as soon as tokens unlock.
+-   **Emergency Contract Functions**: Trigger emergency functions like `pause()` or `withdraw()` on a smart contract owned by the compromised key.
+
+The key components to modify are:
+1.  **`triageStakingWallets`**: Change this function to implement the logic that determines *when* an action is possible for a given wallet.
+2.  **`buildClaimHex`**: Modify this function to encode the correct function signature and arguments for your target contract interaction.
+
+This modular design makes the tool a powerful foundation for nearly any time-sensitive rescue operation on the EVM.
+
+## Troubleshooting
+
+-   **RPC Connection Errors**: Ensure your `RPC_URL` in the `.env` file is correct and that your API key is valid.
+-   **Invalid Private Keys**: Double-check that the keys in `pk.txt` are in the correct format (hex string, with or without `0x` prefix).
+-   **Campaign File Not Found**: Make sure you are passing the correct path to your `campaign.json` file with the `-c` flag.
+-   **Transaction Fails (REVERT)**: This usually indicates an issue with the transaction's calldata.
+    -   Verify that the `abiFile` in `campaign.json` is correct for the `targetContractAddress`.
+    -   Ensure the arguments being passed to `encodeFunctionData` in `buildClaimHex` are correct.
+    -   Use a tool like Tenderly to simulate the transaction and get a detailed stack trace of the revert reason.
