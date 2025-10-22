@@ -1,0 +1,47 @@
+
+{
+  "name": "Caldera Staking Rescue",
+  "type": "staking-rescue",
+  "chainId": 1,
+  "tokenAddress": "0xE2AD0BF751834f2fbdC62A41014f84d67cA1de2A",
+  "targetContractAddress": "0xa148491dcd060d20e836cb9be518f6c30608e3d5",
+  "abiFile": "staking-abi.json",
+  "check": {
+    "function": "getUserTotalStakeAmount",
+    "args": ["<wallet_address>"],
+    "result_label": "total_staked"
+  },
+  "triage": {
+    "type": "staking",
+    "unlocked": {
+      "function": "getUserUnlockedStakeAmount",
+      "args": [{"name": "user", "type": "address"}]
+    },
+    "pending": {
+      "count_function": "getUserWithdrawalRequestCount",
+      "details_function": "withdrawalRequests",
+      "details_args": [{"name": "user", "type": "address"}],
+      "amount_field": "amount",
+      "timestamp_field": "cooldownPeriodEndTimestamp"
+    },
+    "locked": {
+      "count_function": "getUserStakeCount",
+      "details_function": "stakes",
+      "details_args": [{"name": "user", "type": "address"}],
+      "amount_field": "amount",
+      "timestamp_field": "lockedUntilTimestamp"
+    }
+  },
+  "actions": [
+    {
+      "name": "unstake",
+      "function": "unstake",
+      "args": ["amount"]
+    },
+    {
+      "name": "withdraw",
+      "function": "withdraw",
+      "args": ["amount"]
+    }
+  ]
+}
